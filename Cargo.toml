@@ -1,0 +1,32 @@
+[package]
+name = "local-db"
+version = "0.1.0"
+edition = "2021"
+description = "Local SQLite-backed driver that acts as an in-place replacement for Snowflake in integration tests"
+license = "MIT"
+repository = "https://github.com/cvrajeesh/local-db"
+keywords = ["snowflake", "sqlite", "testing", "database", "driver"]
+categories = ["database", "development-tools::testing"]
+
+[lib]
+name = "local_db"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled", "functions", "load_extension"] }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+once_cell = "1.19"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+env_logger = "0.11"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
