@@ -382,7 +382,7 @@ pub fn rewrite_semi_structured_paths(sql: &str) -> String {
 
     // col['field'] → JSON_EXTRACT(col, '$.field')
     static RE_BRACKET_STR: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\[(?:'([^']+)'|\"([^\"]+)\")\]")
+        Regex::new(r#"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\[(?:'([^']+)'|"([^"]+)")\]"#)
             .expect("valid bracket string path regex")
     });
     let sql = RE_BRACKET_STR
