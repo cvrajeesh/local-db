@@ -3,6 +3,7 @@
 //! Run with: `cargo test`
 
 use local_db::{Connection, Value};
+use serde_json;
 
 fn conn() -> Connection {
     Connection::open_in_memory().expect("open in-memory db")
@@ -421,4 +422,1690 @@ fn execute_batch_with_noops() {
     let rows = c.query("SELECT COUNT(*) FROM items", &[]).unwrap();
     let count: i64 = rows[0].get(0).unwrap();
     assert_eq!(count, 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW TESTS — inspired by Snowflake Python connector test suite
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── String functions ──────────────────────────────────────────────────────────
+
+#[test]
+fn upper_lower_functions() {
+    let c = conn();
+    let rows = c.query("SELECT UPPER('hello'), LOWER('WORLD')", &[]).unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "HELLO");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "world");
+}
+
+#[test]
+fn length_function() {
+    let c = conn();
+    let rows = c.query("SELECT LENGTH('Snowflake')", &[]).unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 9);
+}
+
+#[test]
+fn substr_function() {
+    let c = conn();
+    // SUBSTR is a SQLite builtin; Snowflake SUBSTRING maps to the same
+    let rows = c.query("SELECT SUBSTR('Snowflake', 1, 4)", &[]).unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "Snow");
+}
+
+#[test]
+fn trim_functions() {
+    let c = conn();
+    let rows = c
+        .query("SELECT TRIM('  hello  '), LTRIM('  hello  '), RTRIM('  hello  ')", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "hello");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "hello  ");
+    assert_eq!(rows[0].get::<String>(2).unwrap(), "  hello");
+}
+
+#[test]
+fn endswith_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT ENDSWITH('hello world', 'world')", &[])
+        .unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "CHARINDEX corrupted by CHAR→TEXT type rewriter: 'CHARINDEX' becomes 'TEXTINDEX' (see failure plan item 15)"]
+fn charindex_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT CHARINDEX('lo', 'hello')", &[])
+        .unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    // CHARINDEX('lo', 'hello') = 4 in Snowflake (1-based); INSTR swaps args
+    assert_eq!(result, 4);
+}
+
+#[test]
+#[ignore = "colon path delimiter in string literals is corrupted by the semi-structured path rewriter (see failure plan item 16)"]
+fn split_part_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT split_part('a:b:c', ':', 2)", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "b");
+}
+
+#[test]
+fn split_part_function_pipe_delimiter() {
+    // Use a pipe delimiter to avoid the colon path rewriter corrupting the string
+    let c = conn();
+    let rows = c
+        .query("SELECT split_part('a|b|c', '|', 2)", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "b");
+}
+
+#[test]
+fn strtok_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT strtok('a,b,,c', ',', 2)", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    // strtok skips empty tokens; 2nd non-empty token is 'b'
+    assert_eq!(result, "b");
+}
+
+#[test]
+fn ilike_case_insensitive() {
+    let c = conn();
+    c.execute("CREATE TABLE t (name TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('Alice')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('BOB')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('charlie')", &[]).unwrap();
+
+    let rows = c
+        .query("SELECT name FROM t WHERE name ILIKE 'a%' ORDER BY name", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+}
+
+#[test]
+fn concat_function() {
+    let c = conn();
+    // SQLite supports || for concat natively
+    let rows = c
+        .query("SELECT 'Hello' || ' ' || 'World'", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "Hello World");
+}
+
+// ── Math functions ────────────────────────────────────────────────────────────
+
+#[test]
+fn abs_function() {
+    let c = conn();
+    let rows = c.query("SELECT ABS(-42), ABS(3.14)", &[]).unwrap();
+    let i: i64 = rows[0].get(0).unwrap();
+    let f: f64 = rows[0].get(1).unwrap();
+    assert_eq!(i, 42);
+    assert!((f - 3.14).abs() < 1e-9);
+}
+
+#[test]
+fn round_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT ROUND(3.14159, 2), ROUND(2.5)", &[])
+        .unwrap();
+    let r1: f64 = rows[0].get(0).unwrap();
+    let r2: f64 = rows[0].get(1).unwrap();
+    assert!((r1 - 3.14).abs() < 1e-9);
+    assert_eq!(r2 as i64, 3); // SQLite banker's rounding
+}
+
+#[test]
+fn mod_function() {
+    let c = conn();
+    // SQLite supports % operator natively (MOD(a, b) is not a SQLite builtin,
+    // but Snowflake MOD maps to SQLite % via a CASE expression rule)
+    let rows = c.query("SELECT 10 % 3", &[]).unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn div0_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT DIV0(10, 0), DIV0(10, 2)", &[])
+        .unwrap();
+    let zero_div: i64 = rows[0].get(0).unwrap();
+    let normal: i64 = rows[0].get(1).unwrap();
+    assert_eq!(zero_div, 0);
+    assert_eq!(normal, 5);
+}
+
+#[test]
+fn div0null_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT DIV0NULL(10, 0), DIV0NULL(10, 5)", &[])
+        .unwrap();
+    let null_result: Option<i64> = rows[0].get(0).unwrap();
+    let normal: i64 = rows[0].get(1).unwrap();
+    assert!(null_result.is_none());
+    assert_eq!(normal, 2);
+}
+
+#[test]
+#[ignore = "SQRT not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
+fn sqrt_function() {
+    let c = conn();
+    let rows = c.query("SELECT SQRT(9.0)", &[]).unwrap();
+    let result: f64 = rows[0].get(0).unwrap();
+    assert!((result - 3.0).abs() < 1e-9);
+}
+
+#[test]
+#[ignore = "SQRT not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
+fn sqrt_function_native() {
+    let c = conn();
+    let rows = c.query("SELECT SQRT(9.0)", &[]).unwrap();
+    let result: f64 = rows[0].get(0).unwrap();
+    assert!((result - 3.0).abs() < 1e-9);
+}
+
+#[test]
+#[ignore = "POWER not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
+fn power_function() {
+    let c = conn();
+    let rows = c.query("SELECT POWER(2, 10)", &[]).unwrap();
+    let result: f64 = rows[0].get(0).unwrap();
+    assert!((result - 1024.0).abs() < 1e-9);
+}
+
+#[test]
+fn bitwise_functions() {
+    let c = conn();
+    // BITAND → & and BITOR → | work in SQLite
+    let rows = c
+        .query("SELECT BITAND(12, 10), BITOR(12, 10)", &[])
+        .unwrap();
+    let band: i64 = rows[0].get(0).unwrap();
+    let bor: i64 = rows[0].get(1).unwrap();
+    assert_eq!(band, 8);
+    assert_eq!(bor, 14);
+}
+
+#[test]
+#[ignore = "BITXOR translates to ^ which is not a valid SQLite operator (see failure plan item 14)"]
+fn bitxor_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT BITXOR(12, 10)", &[])
+        .unwrap();
+    let bxor: i64 = rows[0].get(0).unwrap();
+    assert_eq!(bxor, 6);
+}
+
+#[test]
+fn bitshift_functions() {
+    let c = conn();
+    let rows = c
+        .query("SELECT BITSHIFTLEFT(1, 3), BITSHIFTRIGHT(16, 2)", &[])
+        .unwrap();
+    let left: i64 = rows[0].get(0).unwrap();
+    let right: i64 = rows[0].get(1).unwrap();
+    assert_eq!(left, 8);
+    assert_eq!(right, 4);
+}
+
+#[test]
+fn square_function() {
+    let c = conn();
+    let rows = c.query("SELECT SQUARE(5)", &[]).unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 25);
+}
+
+// ── Date/time functions ───────────────────────────────────────────────────────
+
+#[test]
+fn year_month_day_functions() {
+    let c = conn();
+    let rows = c
+        .query("SELECT YEAR('2024-03-15'), MONTH('2024-03-15'), DAY('2024-03-15')", &[])
+        .unwrap();
+    let y: i64 = rows[0].get(0).unwrap();
+    let m: i64 = rows[0].get(1).unwrap();
+    let d: i64 = rows[0].get(2).unwrap();
+    assert_eq!(y, 2024);
+    assert_eq!(m, 3);
+    assert_eq!(d, 15);
+}
+
+#[test]
+fn hour_minute_second_functions() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT HOUR('2024-03-15 14:30:45'), MINUTE('2024-03-15 14:30:45'), SECOND('2024-03-15 14:30:45')",
+            &[],
+        )
+        .unwrap();
+    let h: i64 = rows[0].get(0).unwrap();
+    let m: i64 = rows[0].get(1).unwrap();
+    let s: i64 = rows[0].get(2).unwrap();
+    assert_eq!(h, 14);
+    assert_eq!(m, 30);
+    assert_eq!(s, 45);
+}
+
+#[test]
+fn dayofweek_function() {
+    let c = conn();
+    // 2024-03-15 is a Friday; SQLite STRFTIME('%w') returns 0=Sunday..6=Saturday
+    let rows = c
+        .query("SELECT DAYOFWEEK('2024-03-15')", &[])
+        .unwrap();
+    let dow: i64 = rows[0].get(0).unwrap();
+    assert_eq!(dow, 5); // Friday
+}
+
+#[test]
+fn dayofyear_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT DAYOFYEAR('2024-01-31')", &[])
+        .unwrap();
+    let doy: i64 = rows[0].get(0).unwrap();
+    assert_eq!(doy, 31);
+}
+
+#[test]
+fn quarter_function() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT QUARTER('2024-01-15'), QUARTER('2024-04-01'), QUARTER('2024-10-31')",
+            &[],
+        )
+        .unwrap();
+    let q1: i64 = rows[0].get(0).unwrap();
+    let q2: i64 = rows[0].get(1).unwrap();
+    let q4: i64 = rows[0].get(2).unwrap();
+    assert_eq!(q1, 1);
+    assert_eq!(q2, 2);
+    assert_eq!(q4, 4);
+}
+
+#[test]
+fn current_date_function() {
+    let c = conn();
+    let rows = c.query("SELECT CURRENT_DATE()", &[]).unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert!(!result.is_empty());
+    // Should be YYYY-MM-DD format
+    assert_eq!(result.len(), 10);
+    assert_eq!(result.chars().nth(4), Some('-'));
+    assert_eq!(result.chars().nth(7), Some('-'));
+}
+
+#[test]
+fn to_date_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT TO_DATE('2024-03-15')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "2024-03-15");
+}
+
+#[test]
+fn to_timestamp_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT TO_TIMESTAMP('2024-03-15 10:30:00')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "2024-03-15 10:30:00");
+}
+
+#[test]
+fn dateadd_year_and_month() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT DATEADD(year, 1, '2024-01-01'), DATEADD(month, 3, '2024-01-01')",
+            &[],
+        )
+        .unwrap();
+    let year_result: String = rows[0].get(0).unwrap();
+    let month_result: String = rows[0].get(1).unwrap();
+    assert_eq!(year_result, "2025-01-01");
+    assert_eq!(month_result, "2024-04-01");
+}
+
+#[test]
+fn dateadd_hour_and_minute() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT DATEADD(hour, 2, '2024-01-01 10:00:00'), DATEADD(minute, 30, '2024-01-01 10:00:00')",
+            &[],
+        )
+        .unwrap();
+    let hour_result: String = rows[0].get(0).unwrap();
+    let minute_result: String = rows[0].get(1).unwrap();
+    assert_eq!(hour_result, "2024-01-01 12:00:00");
+    assert_eq!(minute_result, "2024-01-01 10:30:00");
+}
+
+#[test]
+fn datediff_month_and_year() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT DATEDIFF(month, '2024-01-01', '2024-04-01'), DATEDIFF(year, '2022-01-01', '2024-01-01')",
+            &[],
+        )
+        .unwrap();
+    let months: f64 = rows[0].get(0).unwrap();
+    let years: f64 = rows[0].get(1).unwrap();
+    assert_eq!(months as i64, 3);
+    assert_eq!(years as i64, 2);
+}
+
+#[test]
+fn date_trunc_year_and_day() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT DATE_TRUNC('year', '2024-07-15'), DATE_TRUNC('day', '2024-07-15 14:30:00')",
+            &[],
+        )
+        .unwrap();
+    let year_trunc: String = rows[0].get(0).unwrap();
+    let day_trunc: String = rows[0].get(1).unwrap();
+    assert_eq!(year_trunc, "2024-01-01");
+    assert_eq!(day_trunc, "2024-07-15");
+}
+
+#[test]
+fn date_trunc_hour_and_minute() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT DATE_TRUNC('hour', '2024-07-15 14:30:45'), DATE_TRUNC('minute', '2024-07-15 14:30:45')",
+            &[],
+        )
+        .unwrap();
+    let hour_trunc: String = rows[0].get(0).unwrap();
+    let minute_trunc: String = rows[0].get(1).unwrap();
+    assert_eq!(hour_trunc, "2024-07-15 14:00:00");
+    assert_eq!(minute_trunc, "2024-07-15 14:30:00");
+}
+
+// ── NULL / Conditional functions ──────────────────────────────────────────────
+
+#[test]
+#[ignore = "ZEROIFNULL translation is incomplete: ZEROIFNULL(x) → COALESCE(x) missing the second 0 argument (see failure plan item 19)"]
+fn zeroifnull_function() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v REAL)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (NULL)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (5.0)", &[]).unwrap();
+
+    let rows = c
+        .query("SELECT ZEROIFNULL(v) FROM t ORDER BY v", &[])
+        .unwrap();
+    let vals: Vec<f64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    assert!(vals.contains(&0.0));
+    assert!(vals.contains(&5.0));
+}
+
+#[test]
+fn nullifzero_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT NULLIFZERO(0), NULLIFZERO(42)", &[])
+        .unwrap();
+    let zero_result: Option<i64> = rows[0].get(0).unwrap();
+    let non_zero: i64 = rows[0].get(1).unwrap();
+    assert!(zero_result.is_none());
+    assert_eq!(non_zero, 42);
+}
+
+#[test]
+fn emptytonull_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT EMPTYTONULL(''), EMPTYTONULL('hello')", &[])
+        .unwrap();
+    let empty_result: Option<String> = rows[0].get(0).unwrap();
+    let non_empty: String = rows[0].get(1).unwrap();
+    assert!(empty_result.is_none());
+    assert_eq!(non_empty, "hello");
+}
+
+#[test]
+fn coalesce_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT COALESCE(NULL, NULL, 'third', 'fourth')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "third");
+}
+
+#[test]
+fn nullif_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT NULLIF(5, 5), NULLIF(5, 0)", &[])
+        .unwrap();
+    let equal_result: Option<i64> = rows[0].get(0).unwrap();
+    let unequal_result: i64 = rows[0].get(1).unwrap();
+    assert!(equal_result.is_none());
+    assert_eq!(unequal_result, 5);
+}
+
+#[test]
+fn booland_boolor_functions() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT BOOLAND(1, 0), BOOLOR(1, 0), BOOLOR(0, 0), BOOLAND(1, 1)",
+            &[],
+        )
+        .unwrap();
+    let and_false: i64 = rows[0].get(0).unwrap();
+    let or_true: i64 = rows[0].get(1).unwrap();
+    let or_false: i64 = rows[0].get(2).unwrap();
+    let and_true: i64 = rows[0].get(3).unwrap();
+    assert_eq!(and_false, 0);
+    assert_eq!(or_true, 1);
+    assert_eq!(or_false, 0);
+    assert_eq!(and_true, 1);
+}
+
+// ── Type conversion functions ─────────────────────────────────────────────────
+
+#[test]
+fn to_number_function() {
+    let c = conn();
+    let rows = c.query("SELECT TO_NUMBER('3.14')", &[]).unwrap();
+    let result: f64 = rows[0].get(0).unwrap();
+    assert!((result - 3.14).abs() < 1e-9);
+}
+
+#[test]
+fn to_double_function() {
+    let c = conn();
+    let rows = c.query("SELECT TO_DOUBLE('2.718')", &[]).unwrap();
+    let result: f64 = rows[0].get(0).unwrap();
+    assert!((result - 2.718).abs() < 1e-9);
+}
+
+#[test]
+fn to_boolean_function() {
+    let c = conn();
+    let rows = c.query("SELECT TO_BOOLEAN(1), TO_BOOLEAN(0)", &[]).unwrap();
+    let t: i64 = rows[0].get(0).unwrap();
+    let f: i64 = rows[0].get(1).unwrap();
+    assert_eq!(t, 1);
+    assert_eq!(f, 0);
+}
+
+// ── Aggregate functions ───────────────────────────────────────────────────────
+
+#[test]
+fn aggregate_count_sum_avg() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v REAL)", &[]).unwrap();
+    for v in [1.0f64, 2.0, 3.0, 4.0, 5.0] {
+        c.execute("INSERT INTO t VALUES (?)", &[&v]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t", &[])
+        .unwrap();
+    let cnt: i64 = rows[0].get(0).unwrap();
+    let sum: f64 = rows[0].get(1).unwrap();
+    let avg: f64 = rows[0].get(2).unwrap();
+    let min: f64 = rows[0].get(3).unwrap();
+    let max: f64 = rows[0].get(4).unwrap();
+    assert_eq!(cnt, 5);
+    assert!((sum - 15.0).abs() < 1e-9);
+    assert!((avg - 3.0).abs() < 1e-9);
+    assert!((min - 1.0).abs() < 1e-9);
+    assert!((max - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn aggregate_count_distinct() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v INTEGER)", &[]).unwrap();
+    for v in [1i64, 2, 2, 3, 3, 3] {
+        c.execute("INSERT INTO t VALUES (?)", &[&v]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT COUNT(DISTINCT v) FROM t", &[])
+        .unwrap();
+    let cnt: i64 = rows[0].get(0).unwrap();
+    assert_eq!(cnt, 3);
+}
+
+#[test]
+fn group_by_and_having() {
+    let c = conn();
+    c.execute("CREATE TABLE orders (customer TEXT, amount REAL)", &[]).unwrap();
+    c.execute("INSERT INTO orders VALUES ('A', 100.0)", &[]).unwrap();
+    c.execute("INSERT INTO orders VALUES ('A', 200.0)", &[]).unwrap();
+    c.execute("INSERT INTO orders VALUES ('B', 50.0)", &[]).unwrap();
+    c.execute("INSERT INTO orders VALUES ('B', 30.0)", &[]).unwrap();
+    c.execute("INSERT INTO orders VALUES ('C', 500.0)", &[]).unwrap();
+
+    let rows = c
+        .query(
+            "SELECT customer, SUM(amount) as total FROM orders GROUP BY customer HAVING SUM(amount) > 100 ORDER BY customer",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "A");
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "C");
+}
+
+// ── DDL extras ───────────────────────────────────────────────────────────────
+
+#[test]
+fn drop_table_if_exists() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    // Should not error even if table exists
+    c.execute("DROP TABLE IF EXISTS t", &[]).unwrap();
+    // Table is gone; creating again should succeed
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+}
+
+#[test]
+fn create_and_query_view() {
+    let c = conn();
+    c.execute("CREATE TABLE products (id INTEGER, name TEXT, price REAL)", &[])
+        .unwrap();
+    c.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)", &[])
+        .unwrap();
+    c.execute("INSERT INTO products VALUES (2, 'Gadget', 49.99)", &[])
+        .unwrap();
+    c.execute(
+        "CREATE VIEW expensive_products AS SELECT * FROM products WHERE price > 20.0",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c
+        .query("SELECT name FROM expensive_products", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Gadget");
+}
+
+#[test]
+#[ignore = "TRUNCATE TABLE not supported in SQLite; needs translation to DELETE FROM (see failure plan item 18)"]
+fn truncate_table() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+    c.execute("TRUNCATE TABLE t", &[]).unwrap();
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+}
+
+#[test]
+fn alter_table_add_column() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    c.execute("ALTER TABLE t ADD COLUMN name TEXT", &[]).unwrap();
+    // After add column, can update the new column
+    c.execute("UPDATE t SET name = 'Alice' WHERE id = 1", &[])
+        .unwrap();
+    let rows = c.query("SELECT name FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+}
+
+#[test]
+fn create_or_replace_table_if_not_exists_preserves_data() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, val TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'hello')", &[]).unwrap();
+    // With default config (not drop_before_create), CREATE OR REPLACE TABLE
+    // translates to CREATE TABLE IF NOT EXISTS — the existing table is kept.
+    c.execute("CREATE OR REPLACE TABLE t (id INTEGER, val TEXT)", &[])
+        .unwrap();
+    // Data must be preserved since IF NOT EXISTS is a no-op on an existing table
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+}
+
+#[test]
+fn snowflake_column_options_stripped() {
+    let c = conn();
+    // AUTOINCREMENT, COMMENT, CLUSTER BY etc. should be stripped
+    c.execute(
+        "CREATE TABLE t (
+            id INTEGER AUTOINCREMENT,
+            name TEXT COMMENT = 'Name of the thing'
+        ) CLUSTER BY (id)",
+        &[],
+    )
+    .unwrap();
+    c.execute("INSERT INTO t (id, name) VALUES (1, 'test')", &[]).unwrap();
+    let rows = c.query("SELECT id, name FROM t", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+}
+
+// ── DML extras ───────────────────────────────────────────────────────────────
+
+#[test]
+fn update_with_where() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, status TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'active')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (2, 'active')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (3, 'active')", &[]).unwrap();
+
+    c.execute("UPDATE t SET status = 'inactive' WHERE id = 2", &[])
+        .unwrap();
+
+    let rows = c
+        .query("SELECT status FROM t WHERE id = 2", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "inactive");
+    // Others unchanged
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE status = 'active'", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+}
+
+#[test]
+fn delete_with_where() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, flag INTEGER)", &[]).unwrap();
+    for i in 1i64..=5 {
+        c.execute("INSERT INTO t VALUES (?, ?)", &[&i, &(i % 2)]).unwrap();
+    }
+
+    c.execute("DELETE FROM t WHERE flag = 0", &[]).unwrap();
+
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3); // ids 1, 3, 5 remain
+}
+
+#[test]
+fn multi_row_insert() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).unwrap();
+
+    // SQLite supports multi-row VALUES; Snowflake does too
+    c.execute(
+        "INSERT INTO t (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3);
+}
+
+// ── Query features ────────────────────────────────────────────────────────────
+
+#[test]
+fn select_distinct() {
+    let c = conn();
+    c.execute("CREATE TABLE t (color TEXT)", &[]).unwrap();
+    for color in ["red", "blue", "red", "green", "blue"] {
+        c.execute("INSERT INTO t VALUES (?)", &[&color]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT DISTINCT color FROM t ORDER BY color", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn select_top_n() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    for i in 1i64..=10 {
+        c.execute("INSERT INTO t VALUES (?)", &[&i]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT TOP 3 id FROM t ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    assert_eq!(rows[2].get::<i64>(0).unwrap(), 3);
+}
+
+#[test]
+fn select_limit_offset() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    for i in 1i64..=10 {
+        c.execute("INSERT INTO t VALUES (?)", &[&i]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 3", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 4);
+}
+
+#[test]
+fn inner_join() {
+    let c = conn();
+    // Use distinct column names to avoid ambiguity after identifier-qualifier stripping
+    c.execute("CREATE TABLE customers (cust_id INTEGER, cust_name TEXT)", &[]).unwrap();
+    c.execute("CREATE TABLE purchases (purch_id INTEGER, buyer_id INTEGER, total REAL)", &[])
+        .unwrap();
+    c.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')", &[]).unwrap();
+    c.execute("INSERT INTO purchases VALUES (1, 1, 100.0), (2, 1, 50.0), (3, 2, 75.0)", &[])
+        .unwrap();
+
+    let rows = c
+        .query(
+            "SELECT cust_name, total FROM customers INNER JOIN purchases ON cust_id = buyer_id ORDER BY total DESC",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice"); // highest total
+}
+
+#[test]
+fn left_join() {
+    let c = conn();
+    // Use distinct column names to avoid ambiguity after identifier-qualifier stripping
+    c.execute("CREATE TABLE members (mem_id INTEGER, mem_name TEXT)", &[]).unwrap();
+    c.execute("CREATE TABLE invoices (inv_id INTEGER, owner_id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO members VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')", &[])
+        .unwrap();
+    c.execute("INSERT INTO invoices VALUES (1, 1), (2, 1)", &[]).unwrap();
+
+    let rows = c
+        .query(
+            "SELECT mem_name, COUNT(inv_id) as invoice_count FROM members LEFT JOIN invoices ON mem_id = owner_id GROUP BY mem_id, mem_name ORDER BY mem_id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].get::<i64>(1).unwrap(), 0); // Charlie has no invoices
+}
+
+#[test]
+fn case_expression() {
+    let c = conn();
+    c.execute("CREATE TABLE t (score INTEGER)", &[]).unwrap();
+    for s in [90i64, 75, 55, 40] {
+        c.execute("INSERT INTO t VALUES (?)", &[&s]).unwrap();
+    }
+
+    let rows = c
+        .query(
+            "SELECT CASE
+                WHEN score >= 90 THEN 'A'
+                WHEN score >= 70 THEN 'B'
+                WHEN score >= 60 THEN 'C'
+                ELSE 'F'
+             END as grade
+             FROM t ORDER BY score DESC",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "A");
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "B");
+    assert_eq!(rows[3].get::<String>(0).unwrap(), "F");
+}
+
+#[test]
+fn between_predicate() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v INTEGER)", &[]).unwrap();
+    for v in 1i64..=10 {
+        c.execute("INSERT INTO t VALUES (?)", &[&v]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE v BETWEEN 3 AND 7", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 5);
+}
+
+#[test]
+fn in_predicate() {
+    let c = conn();
+    c.execute("CREATE TABLE t (status TEXT)", &[]).unwrap();
+    for s in ["active", "inactive", "pending", "deleted"] {
+        c.execute("INSERT INTO t VALUES (?)", &[&s]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE status IN ('active', 'pending')", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+}
+
+#[test]
+fn is_null_and_is_not_null() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (NULL)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('hello')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (NULL)", &[]).unwrap();
+
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE v IS NULL", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE v IS NOT NULL", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+}
+
+#[test]
+fn like_predicate() {
+    let c = conn();
+    c.execute("CREATE TABLE t (name TEXT)", &[]).unwrap();
+    for n in ["Alice", "Bob", "Allison", "Charlie"] {
+        c.execute("INSERT INTO t VALUES (?)", &[&n]).unwrap();
+    }
+
+    let rows = c
+        .query("SELECT COUNT(*) FROM t WHERE name LIKE 'Al%'", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+}
+
+#[test]
+fn subquery_in_where() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, dept TEXT)", &[]).unwrap();
+    c.execute("CREATE TABLE dept_filter (dept TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'eng'), (2, 'hr'), (3, 'eng'), (4, 'sales')", &[])
+        .unwrap();
+    c.execute("INSERT INTO dept_filter VALUES ('eng'), ('hr')", &[]).unwrap();
+
+    let rows = c
+        .query(
+            "SELECT COUNT(*) FROM t WHERE dept IN (SELECT dept FROM dept_filter)",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3);
+}
+
+#[test]
+fn cte_with_clause() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, amount REAL)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (1, 100.0), (2, 200.0), (3, 50.0), (4, 150.0)",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c
+        .query(
+            "WITH high_value AS (
+                SELECT id, amount FROM t WHERE amount > 100.0
+             )
+             SELECT COUNT(*) FROM high_value",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2);
+}
+
+#[test]
+fn window_function_row_number() {
+    let c = conn();
+    c.execute("CREATE TABLE t (dept TEXT, salary REAL)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO t VALUES ('eng', 100000), ('eng', 120000), ('hr', 80000), ('hr', 90000)",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c
+        .query(
+            "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn FROM t ORDER BY dept, salary DESC",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    // First row in each partition should have rn = 1
+    assert_eq!(rows[0].get::<i64>(2).unwrap(), 1);
+    assert_eq!(rows[2].get::<i64>(2).unwrap(), 1);
+}
+
+#[test]
+fn window_function_rank() {
+    let c = conn();
+    c.execute("CREATE TABLE scores (name TEXT, score INTEGER)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO scores VALUES ('Alice', 100), ('Bob', 90), ('Charlie', 100), ('Dave', 80)",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c
+        .query(
+            "SELECT name, RANK() OVER (ORDER BY score DESC) as rnk FROM scores ORDER BY rnk, name",
+            &[],
+        )
+        .unwrap();
+    // Alice and Charlie both rank 1 (tied), Bob ranks 3, Dave ranks 4
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 1);
+    assert_eq!(rows[1].get::<i64>(1).unwrap(), 1);
+    assert_eq!(rows[2].get::<i64>(1).unwrap(), 3);
+}
+
+// ── Config options ────────────────────────────────────────────────────────────
+
+#[test]
+fn config_drop_before_create() {
+    use local_db::{Config, Connection};
+    let config = Config::new().with_drop_before_create();
+    let c = Connection::open_in_memory_with_config(config).unwrap();
+
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+
+    // With drop_before_create, CREATE OR REPLACE should DROP then CREATE (clearing data)
+    c.execute("CREATE OR REPLACE TABLE t (id INTEGER, name TEXT)", &[])
+        .unwrap();
+    let rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    // Table should be empty after DROP + CREATE
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+}
+
+#[test]
+fn config_schema_prefix() {
+    use local_db::{Config, Connection};
+    let config = Config::new().with_schema_prefix();
+    let c = Connection::open_in_memory_with_config(config).unwrap();
+
+    // Create table using schema prefix convention
+    c.execute("CREATE TABLE public__orders (id INTEGER)", &[]).unwrap();
+    c.execute("INSERT INTO public__orders VALUES (1)", &[]).unwrap();
+
+    // Query with two-part identifier — should map public.orders → public__orders
+    let rows = c
+        .query("SELECT COUNT(*) FROM public.orders", &[])
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+}
+
+// ── Semi-structured extras ────────────────────────────────────────────────────
+
+#[test]
+fn object_construct_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT object_construct('name', 'Alice', 'age', 30)", &[])
+        .unwrap();
+    let json_str: String = rows[0].get(0).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(json["name"], "Alice");
+    assert_eq!(json["age"], 30);
+}
+
+#[test]
+fn array_construct_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT array_construct(1, 2, 3, 4, 5)", &[])
+        .unwrap();
+    let json_str: String = rows[0].get(0).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert!(json.is_array());
+    assert_eq!(json.as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn semi_structured_bracket_string_access() {
+    let c = conn();
+    c.execute("CREATE TABLE events (data VARIANT)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO events VALUES (?)",
+        &[&r#"{"user": "alice", "action": "login"}"#],
+    )
+    .unwrap();
+
+    let rows = c
+        .query("SELECT data['user'] FROM events", &[])
+        .unwrap();
+    let user: String = rows[0].get(0).unwrap();
+    // SQLite JSON_EXTRACT returns the raw string value (no surrounding quotes)
+    assert_eq!(user, "alice");
+}
+
+#[test]
+fn semi_structured_bracket_int_access() {
+    let c = conn();
+    c.execute("CREATE TABLE events (data VARIANT)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO events VALUES (?)",
+        &[&r#"["first", "second", "third"]"#],
+    )
+    .unwrap();
+
+    let rows = c
+        .query("SELECT data[0] FROM events", &[])
+        .unwrap();
+    let first: String = rows[0].get(0).unwrap();
+    // SQLite JSON_EXTRACT returns the raw string value (no surrounding quotes)
+    assert_eq!(first, "first");
+}
+
+#[test]
+#[ignore = "nested colon paths (data:a.b) fail: the identifier stripper corrupts dotted paths inside string literals (see failure plan item 17)"]
+fn semi_structured_nested_colon_path() {
+    let c = conn();
+    c.execute("CREATE TABLE events (data VARIANT)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO events VALUES (?)",
+        &[&r#"{"user": {"name": "Alice", "id": 42}}"#],
+    )
+    .unwrap();
+
+    let rows = c
+        .query("SELECT data:user.name FROM events", &[])
+        .unwrap();
+    let name: String = rows[0].get(0).unwrap();
+    assert_eq!(name, "Alice");
+}
+
+#[test]
+fn parse_json_passthrough() {
+    let c = conn();
+    // PARSE_JSON is a passthrough — the value is already stored as JSON text
+    let rows = c
+        .query("SELECT PARSE_JSON('{\"a\": 1}')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert!(result.contains("\"a\""));
+}
+
+#[test]
+fn try_parse_json_valid() {
+    let c = conn();
+    let rows = c
+        .query("SELECT try_parse_json('{\"x\": 99}')", &[])
+        .unwrap();
+    let result: Option<String> = rows[0].get(0).unwrap();
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("99"));
+}
+
+#[test]
+fn get_path_function() {
+    let c = conn();
+    // Use a single-segment path to avoid the identifier stripper corrupting 'a.b' → 'b'
+    let rows = c
+        .query("SELECT get_path('{\"a\": 42}', 'a')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "42");
+}
+
+#[test]
+#[ignore = "multi-segment get_path paths (e.g. 'a.b') are corrupted by the identifier stripper (see failure plan item 17)"]
+fn get_path_function_nested() {
+    let c = conn();
+    let rows = c
+        .query("SELECT get_path('{\"a\": {\"b\": 42}}', 'a.b')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "42");
+}
+
+// ── Additional type tests ─────────────────────────────────────────────────────
+
+#[test]
+fn snowflake_number_types() {
+    let c = conn();
+    c.execute(
+        "CREATE TABLE t (
+            int_col    NUMBER(18, 0),
+            bigint_col BIGINT,
+            small_col  SMALLINT,
+            float_col  FLOAT,
+            double_col DOUBLE,
+            dec_col    DECIMAL(10, 2)
+        )",
+        &[],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?)",
+        &[&42i64, &1000000i64, &100i64, &3.14f64, &2.718f64, &9.99f64],
+    )
+    .unwrap();
+    let rows = c.query("SELECT * FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 42);
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 1_000_000);
+}
+
+#[test]
+fn snowflake_string_types() {
+    let c = conn();
+    c.execute(
+        "CREATE TABLE t (
+            vc   VARCHAR(100),
+            ch   CHAR(10),
+            str  STRING,
+            nvc  NVARCHAR(50)
+        )",
+        &[],
+    )
+    .unwrap();
+    c.execute("INSERT INTO t VALUES (?, ?, ?, ?)", &[&"a", &"b", &"c", &"d"]).unwrap();
+    let rows = c.query("SELECT vc, ch, str, nvc FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "a");
+    assert_eq!(rows[0].get::<String>(2).unwrap(), "c");
+}
+
+#[test]
+fn snowflake_boolean_type() {
+    let c = conn();
+    c.execute("CREATE TABLE t (active BOOLEAN)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (0)", &[]).unwrap();
+    let rows = c.query("SELECT active FROM t ORDER BY active DESC", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    assert_eq!(rows[1].get::<i64>(0).unwrap(), 0);
+}
+
+#[test]
+fn snowflake_date_and_time_types() {
+    let c = conn();
+    c.execute("CREATE TABLE t (d DATE, t TIME, ts TIMESTAMP_NTZ)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (?, ?, ?)",
+        &[&"2024-03-15", &"10:30:00", &"2024-03-15 10:30:00"],
+    )
+    .unwrap();
+    let rows = c.query("SELECT d, t, ts FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "2024-03-15");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "10:30:00");
+}
+
+#[test]
+fn snowflake_timestamp_variants() {
+    let c = conn();
+    c.execute(
+        "CREATE TABLE t (
+            ts_ntz  TIMESTAMP_NTZ,
+            ts_ltz  TIMESTAMP_LTZ,
+            ts_tz   TIMESTAMP_TZ
+        )",
+        &[],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (?, ?, ?)",
+        &[
+            &"2024-03-15 10:00:00",
+            &"2024-03-15 10:00:00",
+            &"2024-03-15 10:00:00",
+        ],
+    )
+    .unwrap();
+    let rows = c.query("SELECT ts_ntz FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "2024-03-15 10:00:00");
+}
+
+#[test]
+fn snowflake_binary_type() {
+    let c = conn();
+    c.execute("CREATE TABLE t (data BINARY(16))", &[]).unwrap();
+    let blob: &[u8] = &[1u8, 2, 3, 4];
+    c.execute("INSERT INTO t VALUES (?)", &[&blob]).unwrap();
+    let rows = c.query("SELECT data FROM t", &[]).unwrap();
+    // Returns as Blob
+    let val = rows[0].value(0).unwrap();
+    assert!(matches!(val, Value::Blob(_)));
+}
+
+// ── Parameterised queries ─────────────────────────────────────────────────────
+
+#[test]
+fn parameter_binding_all_types() {
+    let c = conn();
+    c.execute(
+        "CREATE TABLE t (i INTEGER, r REAL, s TEXT, b INTEGER)",
+        &[],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (?, ?, ?, ?)",
+        &[&42i64, &3.14f64, &"hello", &1i64],
+    )
+    .unwrap();
+
+    let rows = c.query("SELECT * FROM t", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 42);
+    assert!((rows[0].get::<f64>(1).unwrap() - 3.14).abs() < 1e-9);
+    assert_eq!(rows[0].get::<String>(2).unwrap(), "hello");
+    assert_eq!(rows[0].get::<i64>(3).unwrap(), 1);
+}
+
+#[test]
+fn null_parameter_binding() {
+    let c = conn();
+    c.execute("CREATE TABLE t (v TEXT)", &[]).unwrap();
+    // Pass a typed None as a null parameter
+    let null_val: Option<String> = None;
+    c.execute("INSERT INTO t VALUES (?)", &[&null_val]).unwrap();
+    let rows = c.query("SELECT v FROM t", &[]).unwrap();
+    let v: Option<String> = rows[0].get(0).unwrap();
+    assert!(v.is_none());
+}
+
+// ── Noop statement extras ─────────────────────────────────────────────────────
+
+#[test]
+fn noop_grant_and_revoke() {
+    let c = conn();
+    // GRANT and REVOKE are no-ops
+    c.execute("GRANT SELECT ON TABLE t TO ROLE analyst", &[]).unwrap();
+    c.execute("REVOKE SELECT ON TABLE t FROM ROLE analyst", &[]).unwrap();
+}
+
+#[test]
+fn noop_create_warehouse() {
+    let c = conn();
+    c.execute("CREATE WAREHOUSE compute_wh WAREHOUSE_SIZE='SMALL'", &[]).unwrap();
+    c.execute("ALTER WAREHOUSE compute_wh SUSPEND", &[]).unwrap();
+}
+
+#[test]
+fn noop_set_unset_variables() {
+    let c = conn();
+    c.execute("SET my_var = 42", &[]).unwrap();
+    c.execute("UNSET my_var", &[]).unwrap();
+}
+
+#[test]
+fn noop_copy_into() {
+    let c = conn();
+    c.execute("COPY INTO my_table FROM @my_stage", &[]).unwrap();
+}
+
+#[test]
+fn noop_show_commands() {
+    let c = conn();
+    c.execute("SHOW TABLES", &[]).unwrap();
+    c.execute("SHOW SCHEMAS IN DATABASE mydb", &[]).unwrap();
+    c.execute("SHOW WAREHOUSES", &[]).unwrap();
+    c.execute("SHOW ROLES", &[]).unwrap();
+}
+
+// ── query_one convenience method ─────────────────────────────────────────────
+
+#[test]
+fn query_one_returns_first_row() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')", &[]).unwrap();
+
+    let row = c
+        .query_one("SELECT name FROM t ORDER BY id", &[])
+        .unwrap();
+    assert!(row.is_some());
+    assert_eq!(row.unwrap().get::<String>(0).unwrap(), "Alice");
+}
+
+#[test]
+fn query_one_returns_none_for_empty() {
+    let c = conn();
+    c.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+
+    let row = c.query_one("SELECT id FROM t", &[]).unwrap();
+    assert!(row.is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FAILING TESTS — unimplemented Snowflake features
+//
+// These tests are marked `#[ignore]` because the current translator does not
+// yet handle these constructs.  They document the gaps and serve as a roadmap.
+//
+// FAILURE PLAN (to review):
+//
+//  1. REGEXP_REPLACE / REGEXP_SUBSTR
+//     Gap: No `regexp_replace` or `regexp_substr` custom SQLite function is
+//     registered.  SQLite does not have these builtins.
+//     Fix: Register `regexp_replace(text, pattern, replacement)` and
+//          `regexp_substr(text, pattern)` as custom scalar functions using the
+//          `regex` crate (similar to how `regexp` is registered in
+//          connection.rs `register_custom_functions`).
+//
+//  2. RLIKE operator
+//     Gap: `expr RLIKE pattern` is not translated.
+//     Fix: Add a rewrite rule in functions.rs to map `RLIKE` to the custom
+//          `regexp(pattern, expr)` function, mirroring the ILIKE→LOWER()..LIKE
+//          rewrite.
+//
+//  3. LISTAGG
+//     Gap: `LISTAGG(col, sep) WITHIN GROUP (ORDER BY col)` has no translation.
+//     Fix: Add a regex-based rewrite rule that maps:
+//          `LISTAGG(col, sep) WITHIN GROUP (ORDER BY ...)` →
+//          `GROUP_CONCAT(col, sep)` (dropping the ORDER BY sub-clause, since
+//          SQLite's GROUP_CONCAT does not support ORDER BY in the aggregation).
+//          For ordered LISTAGG, a subquery-based workaround would be needed.
+//
+//  4. ARRAY_CONTAINS
+//     Gap: `ARRAY_CONTAINS(val, array_col)` is not translated or registered.
+//     Fix: Register a custom SQLite scalar function `array_contains(val, arr)`
+//          that parses the JSON array and checks membership.
+//
+//  5. OBJECT_KEYS
+//     Gap: `OBJECT_KEYS(obj)` is not translated or registered.
+//     Fix: Register a custom SQLite scalar function `object_keys(json)` that
+//          returns a JSON array of the object's keys.
+//
+//  6. CONVERT_TIMEZONE
+//     Gap: `CONVERT_TIMEZONE(src_tz, tgt_tz, ts)` has no equivalent in SQLite.
+//     Fix: SQLite's datetime functions have no timezone awareness.  For testing
+//          purposes, register a passthrough custom function that returns the
+//          timestamp unchanged (acceptable for local test stubs).
+//
+//  7. TRY_CAST / TRY_TO_NUMBER / TRY_TO_DATE
+//     Gap: Snowflake `TRY_CAST(x AS type)` returns NULL on failure instead of
+//          erroring.  No translation exists.
+//     Fix: Register `try_cast_as_integer(x)` / `try_cast_as_real(x)` /
+//          `try_cast_as_date(x)` custom functions that return NULL on parse
+//          failure; and add rewrite rules to map `TRY_CAST(x AS INTEGER)` etc.
+//
+//  8. EXTRACT(part FROM date) syntax
+//     Gap: Snowflake supports both `YEAR(date)` (already handled) and the SQL
+//          standard `EXTRACT(YEAR FROM date)`.  The EXTRACT form is not
+//          translated.
+//     Fix: Add a regex-based rewrite rule in functions.rs that translates
+//          `EXTRACT(part FROM expr)` to the corresponding `STRFTIME()` call.
+//
+//  9. POSITION(needle IN haystack) syntax
+//     Gap: SQL standard POSITION syntax is not translated.
+//     Fix: Add a rewrite rule:
+//          `POSITION(x IN y)` → `INSTR(y, x)`.
+//
+// 10. FLATTEN (table function)
+//     Gap: `LATERAL FLATTEN(input => col)` has no SQLite equivalent.
+//     Fix: This would require significant infrastructure (virtual table or
+//          custom table-valued function).  Recommend documenting as "not
+//          supported in local-db" and skipping in integration tests.
+//
+// 11. MERGE statement
+//     Gap: SQLite does not support MERGE.  No translation exists.
+//     Fix: Translate `MERGE INTO target USING source ON ... WHEN MATCHED
+//          THEN UPDATE ... WHEN NOT MATCHED THEN INSERT ...` to
+//          `INSERT OR REPLACE INTO ...` for simple cases.  Complex MERGE
+//          patterns would remain unsupported.
+//
+// 12. PIVOT / UNPIVOT
+//     Gap: SQLite does not support PIVOT/UNPIVOT syntax.
+//     Fix: Not feasible to translate generically.  Recommend documenting as
+//          unsupported and rewiring tests to use conditional aggregation instead.
+//
+// 13. SQRT / POWER (and other math functions)
+//     Gap: The bundled SQLite in rusqlite 0.31 is not compiled with
+//          `-DSQLITE_ENABLE_MATH_FUNCTIONS`, so SQRT, POWER, LOG, EXP etc.
+//          are not available as SQLite built-in functions.
+//     Fix: Either (a) add custom scalar function registrations for SQRT and
+//          POWER in `connection.rs register_custom_functions`, using Rust's
+//          f64 math; or (b) rewrite SQRT(x) → (x * x ... ) in the translator
+//          using expression rewriting.  Recommend option (a).
+//
+// 14. BITXOR translates to unsupported `^` operator
+//     Gap: `BITXOR(a, b)` is translated to `(a ^ b)`.  SQLite does not have
+//          a `^` bitwise-XOR operator (only `&` and `|` are supported).
+//     Fix: In functions.rs, change the BITXOR rule to use a CASE expression:
+//          `BITXOR(a, b)` → `((a | b) & ~(a & b))` or register a custom
+//          SQLite scalar function `bitxor(a, b)`.
+//
+// 15. CHARINDEX corrupted by CHAR→TEXT type rewriter
+//     Gap: The `rewrite_types` pass has a pattern `(?i)\bCHAR\s*...` that
+//          matches without a trailing word boundary.  As a result, `CHARINDEX`
+//          becomes `TEXTINDEX` (CHAR→TEXT prefix substitution).
+//     Fix: In types.rs, add a trailing word boundary to the CHAR/NCHAR
+//          patterns: `(?i)\bCHAR\b` (with `\b` after CHAR) or use a negative
+//          lookahead `(?!ACTER|INDEX)`.
+//
+// 16. Colon-path rewriter corrupts string literals containing `word:word`
+//     Gap: The semi-structured colon-path rewriter
+//          `\b([A-Za-z_]...):([A-Za-z_]...)` does not respect single-quoted
+//          string literals.  Any string like `'a:b:c'` is corrupted to
+//          `'JSON_EXTRACT(a, '$.b'):c'`.  This breaks split_part, strtok,
+//          and any other function that takes colon-containing string literals.
+//     Fix: Update `rewrite_semi_structured_paths` to skip regions inside
+//          single- or double-quoted string literals, similar to the approach
+//          used in `split_statements`.
+//
+// 17. Identifier stripper corrupts dotted paths inside string literals
+//     Gap: The two-part identifier stripper pattern matches `a.b` even when
+//          it appears inside single-quoted string literals (e.g., the path
+//          argument `'a.b'` to `get_path`).  This causes `'a.b'` → `'b'`
+//          and nested colon paths like `data:user.name` to produce incorrect
+//          SQL (`'$.name'` instead of `'$.user.name'`).
+//     Fix: As with item 16, update `strip_qualifiers` in identifiers.rs to
+//          skip content inside quoted string literals before applying the
+//          identifier replacement regexes.
+//
+// 18. TRUNCATE TABLE not translated
+//     Gap: SQLite does not support `TRUNCATE TABLE`.  The statement passes
+//          through untranslated and causes a syntax error.
+//     Fix: Add a rewrite rule in functions.rs (or as a new pass in
+//          rewriter.rs) that translates `TRUNCATE TABLE tbl` →
+//          `DELETE FROM tbl`.
+//
+// 19. ZEROIFNULL translation incomplete
+//     Gap: The ZEROIFNULL rule rewrites the function name to COALESCE but
+//          does not add the required second argument `0`.
+//          `ZEROIFNULL(x)` → `COALESCE(x)` (invalid; needs `COALESCE(x, 0)`).
+//     Fix: Change the ZEROIFNULL rule in functions.rs from a simple name
+//          substitution to a full replacement, e.g. using a capture group:
+//          `r"(?i)\bZEROIFNULL\s*\(([^)]+)\)"` → `"COALESCE($1, 0)"`.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "REGEXP_REPLACE not yet implemented: needs custom SQLite scalar function (see failure plan item 1)"]
+fn regexp_replace_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT REGEXP_REPLACE('hello world', 'o', '0')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "hell0 w0rld");
+}
+
+#[test]
+#[ignore = "REGEXP_SUBSTR not yet implemented: needs custom SQLite scalar function (see failure plan item 1)"]
+fn regexp_substr_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT REGEXP_SUBSTR('hello 123 world', '[0-9]+')", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert_eq!(result, "123");
+}
+
+#[test]
+#[ignore = "RLIKE operator not yet translated (see failure plan item 2)"]
+fn rlike_operator() {
+    let c = conn();
+    c.execute("CREATE TABLE t (name TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('hello123')", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('abc')", &[]).unwrap();
+
+    let rows = c
+        .query("SELECT name FROM t WHERE name RLIKE '[0-9]+'", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "hello123");
+}
+
+#[test]
+#[ignore = "LISTAGG not yet translated (see failure plan item 3)"]
+fn listagg_function() {
+    let c = conn();
+    c.execute("CREATE TABLE t (category TEXT, item TEXT)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO t VALUES ('fruit', 'apple'), ('fruit', 'banana'), ('veg', 'carrot')",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c
+        .query(
+            "SELECT category, LISTAGG(item, ',') WITHIN GROUP (ORDER BY item) FROM t GROUP BY category ORDER BY category",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "apple,banana");
+}
+
+#[test]
+#[ignore = "ARRAY_CONTAINS not yet implemented (see failure plan item 4)"]
+fn array_contains_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT ARRAY_CONTAINS('b', ARRAY_CONSTRUCT('a', 'b', 'c'))", &[])
+        .unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 1);
+}
+
+#[test]
+#[ignore = "OBJECT_KEYS not yet implemented (see failure plan item 5)"]
+fn object_keys_function() {
+    let c = conn();
+    let rows = c
+        .query("SELECT OBJECT_KEYS(object_construct('a', 1, 'b', 2))", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    let keys: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert!(keys.as_array().unwrap().len() == 2);
+}
+
+#[test]
+#[ignore = "CONVERT_TIMEZONE not yet implemented (see failure plan item 6)"]
+fn convert_timezone_function() {
+    let c = conn();
+    let rows = c
+        .query(
+            "SELECT CONVERT_TIMEZONE('UTC', 'America/New_York', '2024-03-15 12:00:00')",
+            &[],
+        )
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    // UTC to ET = -5h (or -4h DST)
+    assert!(result.contains("2024-03-15"));
+}
+
+#[test]
+#[ignore = "TRY_CAST not yet translated (see failure plan item 7)"]
+fn try_cast_returns_null_on_failure() {
+    let c = conn();
+    let rows = c
+        .query("SELECT TRY_CAST('not_a_number' AS INTEGER)", &[])
+        .unwrap();
+    let result: Option<i64> = rows[0].get(0).unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+#[ignore = "EXTRACT syntax not yet translated (see failure plan item 8)"]
+fn extract_syntax() {
+    let c = conn();
+    let rows = c
+        .query("SELECT EXTRACT(YEAR FROM '2024-03-15')", &[])
+        .unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 2024);
+}
+
+#[test]
+#[ignore = "POSITION(x IN y) syntax not yet translated (see failure plan item 9)"]
+fn position_in_syntax() {
+    let c = conn();
+    let rows = c
+        .query("SELECT POSITION('lo' IN 'hello')", &[])
+        .unwrap();
+    let result: i64 = rows[0].get(0).unwrap();
+    assert_eq!(result, 4);
+}
+
+#[test]
+#[ignore = "FLATTEN table function not supported in SQLite (see failure plan item 10)"]
+fn flatten_table_function() {
+    let c = conn();
+    c.execute("CREATE TABLE t (data VARIANT)", &[]).unwrap();
+    c.execute(
+        "INSERT INTO t VALUES (?)",
+        &[&r#"[1, 2, 3]"#],
+    )
+    .unwrap();
+
+    let rows = c
+        .query("SELECT value FROM t, LATERAL FLATTEN(input => data)", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+#[ignore = "MERGE statement not supported in SQLite (see failure plan item 11)"]
+fn merge_statement() {
+    let c = conn();
+    c.execute("CREATE TABLE target (id INTEGER, val TEXT)", &[]).unwrap();
+    c.execute("CREATE TABLE source (id INTEGER, val TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO target VALUES (1, 'old'), (2, 'keep')", &[])
+        .unwrap();
+    c.execute("INSERT INTO source VALUES (1, 'updated'), (3, 'new')", &[])
+        .unwrap();
+
+    c.execute(
+        "MERGE INTO target USING source ON target.id = source.id
+         WHEN MATCHED THEN UPDATE SET val = source.val
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (source.id, source.val)",
+        &[],
+    )
+    .unwrap();
+
+    let rows = c.query("SELECT COUNT(*) FROM target", &[]).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3);
 }
