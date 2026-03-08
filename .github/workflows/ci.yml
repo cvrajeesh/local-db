@@ -44,3 +44,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --all-features
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Collect coverage data
+        run: cargo llvm-cov --no-report --all-features
+      - name: Generate LCOV report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage summary
+        run: |
+          echo '## 📊 Coverage Report' > coverage-summary.txt
+          echo '```' >> coverage-summary.txt
+          cargo llvm-cov report --summary-only 2>&1 >> coverage-summary.txt
+          echo '```' >> coverage-summary.txt
+      - name: Post coverage comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-report
+          path: coverage-summary.txt
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
