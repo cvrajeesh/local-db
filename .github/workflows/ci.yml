@@ -66,7 +66,11 @@ jobs:
       - name: Generate LCOV report
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage summary
-        run: cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
+        run: |
+          echo '## 📊 Coverage Report' > coverage-summary.txt
+          echo '```' >> coverage-summary.txt
+          cargo llvm-cov report --summary-only 2>&1 >> coverage-summary.txt
+          echo '```' >> coverage-summary.txt
       - name: Post coverage comment on PR
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
