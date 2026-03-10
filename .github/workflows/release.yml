@@ -19,10 +19,15 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz (release)
-        uses: MarcoIeni/release-plz-action@v0.5
+      - uses: taiki-e/install-action@v2
         with:
-          command: release
+          tool: release-plz
+      - name: Configure git
+        run: |
+          git config user.email "release-plz[bot]@users.noreply.github.com"
+          git config user.name "release-plz[bot]"
+      - name: Run release-plz (release)
+        run: RUST_LOG=release_plz=info release-plz release 2>&1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -39,9 +44,14 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz (release-pr)
-        uses: MarcoIeni/release-plz-action@v0.5
+      - uses: taiki-e/install-action@v2
         with:
-          command: release-pr
+          tool: release-plz
+      - name: Configure git
+        run: |
+          git config user.email "release-plz[bot]@users.noreply.github.com"
+          git config user.name "release-plz[bot]"
+      - name: Run release-plz (release-pr)
+        run: RUST_LOG=release_plz=info release-plz release-pr 2>&1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
