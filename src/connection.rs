@@ -375,7 +375,7 @@ fn register_custom_functions(conn: &rusqlite::Connection) -> Result<()> {
 
     // CONCAT_WS(sep, s1, s2, ...) — join non-NULL args with separator
     conn.create_scalar_function("concat_ws", -1, FunctionFlags::SQLITE_UTF8, |ctx| {
-        if ctx.len() < 1 {
+        if ctx.is_empty() {
             return Ok(String::new());
         }
         let sep: String = ctx.get(0)?;
