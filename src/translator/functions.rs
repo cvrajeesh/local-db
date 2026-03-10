@@ -34,6 +34,7 @@ pub fn rewrite_functions(sql: &str) -> String {
     let sql = rewrite_dateadd(&sql);
     let sql = rewrite_datediff(&sql);
     let sql = rewrite_date_trunc(&sql);
+    let sql = rewrite_listagg(&sql);
     let sql = rewrite_semi_structured_paths(&sql);
     let sql = rewrite_ilike(&sql);
     let sql = rewrite_create_or_replace(&sql);
@@ -427,6 +428,58 @@ pub fn rewrite_date_trunc(sql: &str) -> String {
     result
 }
 
+// ── LISTAGG ──────────────────────────────────────────────────────────────────
+
+/// Translate `LISTAGG(expr [, delimiter]) WITHIN GROUP (ORDER BY ...)` →
+/// `GROUP_CONCAT(expr [, delimiter])`.
+///
+/// The `WITHIN GROUP (ORDER BY ...)` clause is consumed and dropped — SQLite's
+/// `GROUP_CONCAT` does not support an internal `ORDER BY`.
+pub fn rewrite_listagg(sql: &str) -> String {
+    static RE_LISTAGG: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\bLISTAGG\s*\(").expect("valid LISTAGG regex"));
+    static RE_WITHIN: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)^\s*WITHIN\s+GROUP\s*\(").expect("valid WITHIN GROUP regex")
+    });
+
+    let mut result = String::with_capacity(sql.len());
+    let len = sql.len();
+    let mut i = 0;
+
+    while i < len {
+        if let Some(m) = RE_LISTAGG.find(&sql[i..]) {
+            result.push_str(&sql[i..i + m.start()]);
+            i += m.end();
+
+            if let Some(args_content) = extract_parenthesized(&sql[i..]) {
+                let parts = split_args(args_content);
+                let expr = parts.first().map(|s| s.trim()).unwrap_or("");
+                let delim = parts.get(1).map(|s| s.trim());
+                i += args_content.len() + 1; // +1 for closing ')'
+
+                // Consume the mandatory WITHIN GROUP (ORDER BY ...) clause
+                if let Some(wm) = RE_WITHIN.find(&sql[i..]) {
+                    let within_start = i + wm.end();
+                    if let Some(within_content) = extract_parenthesized(&sql[within_start..]) {
+                        i = within_start + within_content.len() + 1; // +1 for ')'
+                    }
+                }
+
+                match delim {
+                    Some(d) => result.push_str(&format!("GROUP_CONCAT({expr}, {d})")),
+                    None => result.push_str(&format!("GROUP_CONCAT({expr})")),
+                }
+            } else {
+                result.push_str("LISTAGG(");
+            }
+        } else {
+            result.push_str(&sql[i..]);
+            break;
+        }
+    }
+    result
+}
+
 // ── Semi-structured path expressions ────────────────────────────────────────
 
 /// Translate Snowflake semi-structured paths:
@@ -695,5 +748,32 @@ mod tests {
         assert!(result.contains("CASE status"), "got: {result}");
         assert!(result.contains("WHEN 'A' THEN 'Active'"), "got: {result}");
         assert!(result.contains("ELSE 'Unknown'"), "got: {result}");
+    }
+
+    #[test]
+    fn listagg_with_delimiter() {
+        let result = rewrite_listagg(
+            "SELECT LISTAGG(item, ',') WITHIN GROUP (ORDER BY item) FROM t GROUP BY cat",
+        );
+        assert_eq!(
+            result,
+            "SELECT GROUP_CONCAT(item, ',') FROM t GROUP BY cat"
+        );
+    }
+
+    #[test]
+    fn listagg_without_delimiter() {
+        let result = rewrite_listagg(
+            "SELECT LISTAGG(val) WITHIN GROUP (ORDER BY val) FROM t",
+        );
+        assert_eq!(result, "SELECT GROUP_CONCAT(val) FROM t");
+    }
+
+    #[test]
+    fn listagg_with_nested_function_arg() {
+        let result = rewrite_listagg(
+            "LISTAGG(UPPER(name), '|') WITHIN GROUP (ORDER BY name)",
+        );
+        assert_eq!(result, "GROUP_CONCAT(UPPER(name), '|')");
     }
 }

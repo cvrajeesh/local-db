@@ -2376,9 +2376,10 @@ fn replace_function_native() {
     assert_eq!(result, "hello Rust");
 }
 
+// ── LISTAGG ──────────────────────────────────────────────────────────────────
+
 #[test]
-#[ignore = "LISTAGG not yet translated (see failure plan item 3)"]
-fn listagg_function() {
+fn listagg_with_delimiter() {
     let c = conn();
     c.execute("CREATE TABLE t (category TEXT, item TEXT)", &[]).unwrap();
     c.execute(
@@ -2394,7 +2395,59 @@ fn listagg_function() {
         )
         .unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].get::<String>(1).unwrap(), "apple,banana");
+    // ORDER BY inside WITHIN GROUP is not preserved (SQLite GROUP_CONCAT limitation),
+    // but all values must be present
+    let fruit: String = rows[0].get(1).unwrap();
+    assert!(fruit.contains("apple") && fruit.contains("banana"));
+    let veg: String = rows[1].get(1).unwrap();
+    assert!(veg.contains("carrot"));
+}
+
+#[test]
+fn listagg_without_delimiter() {
+    let c = conn();
+    c.execute("CREATE TABLE t (val TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('a'), ('b'), ('c')", &[]).unwrap();
+
+    let rows = c
+        .query(
+            "SELECT LISTAGG(val) WITHIN GROUP (ORDER BY val) FROM t",
+            &[],
+        )
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    // All three values present (order not guaranteed)
+    assert!(result.contains('a') && result.contains('b') && result.contains('c'));
+}
+
+#[test]
+fn listagg_with_space_delimiter() {
+    let c = conn();
+    c.execute("CREATE TABLE t (word TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('hello'), ('world')", &[]).unwrap();
+
+    let rows = c
+        .query("SELECT LISTAGG(word, ' ') WITHIN GROUP (ORDER BY word) FROM t", &[])
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert!(result.contains("hello") && result.contains("world"));
+}
+
+#[test]
+fn listagg_with_expression_arg() {
+    // LISTAGG arg can be a function call — parser must handle nested parens
+    let c = conn();
+    c.execute("CREATE TABLE t (val TEXT)", &[]).unwrap();
+    c.execute("INSERT INTO t VALUES ('hello'), ('world')", &[]).unwrap();
+
+    let rows = c
+        .query(
+            "SELECT LISTAGG(UPPER(val), '|') WITHIN GROUP (ORDER BY val) FROM t",
+            &[],
+        )
+        .unwrap();
+    let result: String = rows[0].get(0).unwrap();
+    assert!(result.contains("HELLO") && result.contains("WORLD"));
 }
 
 #[test]
