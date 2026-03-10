@@ -28,7 +28,7 @@ jobs:
         id: tag
         run: |
           TAG=$(git tag --points-at ${{ github.event.workflow_run.head_sha }} \
-            | grep '^snowlite-v' | head -1)
+            | grep '^v' | head -1)
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
   build-linux:
