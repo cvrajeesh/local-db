@@ -38,8 +38,7 @@ unchanged — but this is **untested** end-to-end.
 - [x] `REPLACE(str, from, to)` — SQLite native, integration test added
 
 ### LISTAGG (`src/translator/functions.rs`)
-- [ ] `LISTAGG(expr, delim) WITHIN GROUP (ORDER BY ...)` — rewrite to `GROUP_CONCAT(expr, delim)`
-  - Note: SQLite `GROUP_CONCAT` does not support `ORDER BY` inside; document the limitation
+- [x] `LISTAGG(expr, delim) WITHIN GROUP (ORDER BY ...)` — rewrites to `GROUP_CONCAT(expr, delim)`; `WITHIN GROUP` clause consumed and dropped (SQLite limitation: ORDER BY inside GROUP_CONCAT not supported)
 
 ### GREATEST / LEAST (`src/translator/functions.rs`)
 - [ ] `GREATEST(v1, v2, ...)` — SQLite `MAX()` is aggregate-only; rewrite to `CASE WHEN` chain
