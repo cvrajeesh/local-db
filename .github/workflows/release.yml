@@ -14,20 +14,21 @@ jobs:
       startsWith(github.event.head_commit.message, 'chore: release')
     permissions:
       contents: write
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - &checkout
+        name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: release-plz
-      - name: Configure git
-        run: |
-          git config user.email "release-plz[bot]@users.noreply.github.com"
-          git config user.name "release-plz[bot]"
+          persist-credentials: false
+      - &install-rust
+        name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz (release)
-        run: RUST_LOG=release_plz=info release-plz release 2>&1
+        uses: release-plz/action@v0.5
+        with:
+          command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,23 +36,17 @@ jobs:
     name: Release-plz PR
     runs-on: ubuntu-latest
     concurrency:
-      group: release-plz-pr-${{ github.ref }}
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: release-plz
-      - name: Configure git
-        run: |
-          git config user.email "release-plz[bot]@users.noreply.github.com"
-          git config user.name "release-plz[bot]"
+      - *checkout
+      - *install-rust
       - name: Run release-plz (release-pr)
-        run: RUST_LOG=release_plz=info release-plz release-pr 2>&1
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
