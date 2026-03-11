@@ -4094,29 +4094,37 @@ fn get_file_from_stage() {
     assert_eq!(table_count(&c), 0, "GET @stage must not create any SQLite tables");
 }
 
-/// COPY INTO table FROM @stage — loads staged files into a table; silently ignored
-/// (no rows are inserted because this is a testing shim, not a real Snowflake loader).
-/// Verified by: execute() returns 0, table row count stays 0.
+/// COPY INTO table FROM @stage — loads staged files into a table; silently ignored.
+/// Pre-seeded rows verify that COPY INTO neither adds rows from the stage nor removes
+/// existing ones: the count must equal exactly the number of directly-inserted rows.
 #[test]
 fn copy_into_table_from_stage() {
     let c = conn();
     c.execute("CREATE TABLE sales (id INTEGER, amount REAL)", &[]).unwrap();
+    // Pre-populate the target table with known rows before issuing COPY INTO.
+    c.execute("INSERT INTO sales VALUES (1, 100.0), (2, 200.0), (3, 300.0)", &[]).unwrap();
     let stage_affected = c.execute("CREATE STAGE my_stage", &[]).unwrap();
     assert_eq!(stage_affected, 0, "CREATE STAGE should affect 0 rows");
     let copy_affected = c.execute("COPY INTO sales FROM @my_stage", &[]).unwrap();
     assert_eq!(copy_affected, 0, "COPY INTO from stage should affect 0 rows");
-    // COPY INTO is a no-op: the table must remain empty
+    // Row count must equal the pre-seeded rows: COPY INTO must not add or remove any rows.
     let rows = c.query("SELECT COUNT(*) FROM sales", &[]).unwrap();
-    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3, "COPY INTO must not alter pre-existing rows");
 }
 
 /// COPY INTO with FILE_FORMAT and ON_ERROR options is silently ignored.
-/// Verified by: execute() returns 0, table row count stays 0.
+/// Pre-seeded rows verify COPY INTO neither adds rows from the stage nor removes existing ones.
 #[test]
 fn copy_into_table_from_stage_with_options() {
     let c = conn();
     c.execute(
         "CREATE TABLE events (ts TEXT, event_type TEXT, payload VARIANT)",
+        &[],
+    )
+    .unwrap();
+    // Pre-populate the target table with known rows before issuing COPY INTO.
+    c.execute(
+        "INSERT INTO events VALUES ('2024-01-01', 'login', '{}'), ('2024-01-02', 'logout', '{}')",
         &[],
     )
     .unwrap();
@@ -4128,32 +4136,42 @@ fn copy_into_table_from_stage_with_options() {
     )
     .unwrap();
     assert_eq!(affected, 0, "COPY INTO with options should affect 0 rows");
+    // Row count must equal the pre-seeded rows: COPY INTO must not add or remove any rows.
     let rows = c.query("SELECT COUNT(*) FROM events", &[]).unwrap();
-    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2, "COPY INTO must not alter pre-existing rows");
 }
 
 /// COPY INTO with a specific file path inside the stage is silently ignored.
-/// Verified by: execute() returns 0, table row count stays 0.
+/// Pre-seeded rows verify COPY INTO neither adds rows from the stage nor removes existing ones.
 #[test]
 fn copy_into_table_from_stage_file_path() {
     let c = conn();
     c.execute("CREATE TABLE orders (id INTEGER, total REAL)", &[]).unwrap();
+    // Pre-populate the target table with known rows before issuing COPY INTO.
+    c.execute("INSERT INTO orders VALUES (1, 50.0), (2, 75.0)", &[]).unwrap();
     let affected = c.execute(
         "COPY INTO orders FROM @load_stage/orders/2024-01.csv",
         &[],
     )
     .unwrap();
     assert_eq!(affected, 0, "COPY INTO from stage file path should affect 0 rows");
+    // Row count must equal the pre-seeded rows: COPY INTO must not add or remove any rows.
     let rows = c.query("SELECT COUNT(*) FROM orders", &[]).unwrap();
-    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 2, "COPY INTO must not alter pre-existing rows");
 }
 
 /// COPY INTO with column mapping is silently ignored.
-/// Verified by: execute() returns 0, table row count stays 0.
+/// Pre-seeded rows verify COPY INTO neither adds rows from the stage nor removes existing ones.
 #[test]
 fn copy_into_table_with_column_mapping() {
     let c = conn();
     c.execute("CREATE TABLE products (sku TEXT, name TEXT, price REAL)", &[]).unwrap();
+    // Pre-populate the target table with known rows before issuing COPY INTO.
+    c.execute(
+        "INSERT INTO products VALUES ('A001', 'Widget', 9.99), ('B002', 'Gadget', 19.99), ('C003', 'Doohickey', 4.99)",
+        &[],
+    )
+    .unwrap();
     let affected = c.execute(
         "COPY INTO products (sku, name, price)
             FROM (SELECT $1, $2, $3::REAL FROM @product_stage)
@@ -4162,8 +4180,9 @@ fn copy_into_table_with_column_mapping() {
     )
     .unwrap();
     assert_eq!(affected, 0, "COPY INTO with column mapping should affect 0 rows");
+    // Row count must equal the pre-seeded rows: COPY INTO must not add or remove any rows.
     let rows = c.query("SELECT COUNT(*) FROM products", &[]).unwrap();
-    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 3, "COPY INTO must not alter pre-existing rows");
 }
 
 /// COPY INTO @stage FROM table (outbound/unloading) is silently ignored.
