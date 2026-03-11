@@ -3213,3 +3213,561 @@ fn flatten_returns_descriptive_error() {
         "error message should say 'not supported', got: {msg}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN tests — complex Snowflake queries with various join types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Helper to set up a common schema with customers, orders, and products tables.
+///
+/// Column names are unique across tables to avoid ambiguity after snowlite's
+/// identifier stripping removes table-alias prefixes (e.g. `c.name` → `name`).
+fn setup_join_tables(c: &Connection) {
+    c.execute_batch(
+        "
+        CREATE TABLE customers (
+            customer_id   NUMBER(18, 0) NOT NULL,
+            customer_name VARCHAR(100),
+            email         VARCHAR(200),
+            region        VARCHAR(50),
+            signup_date   TIMESTAMP_NTZ
+        );
+        CREATE TABLE orders (
+            order_id      NUMBER(18, 0) NOT NULL,
+            cust_id       NUMBER(18, 0),
+            prod_id       NUMBER(18, 0),
+            quantity      NUMBER(10, 0),
+            total_amount  NUMBER(10, 2),
+            order_date    TIMESTAMP_NTZ,
+            status        VARCHAR(20)
+        );
+        CREATE TABLE products (
+            product_id    NUMBER(18, 0) NOT NULL,
+            product_name  VARCHAR(100),
+            category      VARCHAR(50),
+            price         NUMBER(10, 2)
+        );
+
+        INSERT INTO customers VALUES (1, 'Alice',   'alice@example.com',   'US-East',  '2023-01-10');
+        INSERT INTO customers VALUES (2, 'Bob',     'bob@example.com',     'US-West',  '2023-03-15');
+        INSERT INTO customers VALUES (3, 'Charlie', 'charlie@example.com', 'EU-West',  '2023-06-20');
+        INSERT INTO customers VALUES (4, 'Diana',   'diana@example.com',   'US-East',  '2023-09-01');
+
+        INSERT INTO products VALUES (10, 'Widget',   'Hardware', 25.00);
+        INSERT INTO products VALUES (20, 'Gadget',   'Hardware', 75.00);
+        INSERT INTO products VALUES (30, 'Thingamajig', 'Software', 150.00);
+        INSERT INTO products VALUES (40, 'Doohickey',   'Accessories', 10.00);
+
+        INSERT INTO orders VALUES (100, 1, 10, 4,  100.00, '2024-01-15', 'completed');
+        INSERT INTO orders VALUES (101, 1, 20, 1,   75.00, '2024-02-10', 'completed');
+        INSERT INTO orders VALUES (102, 2, 30, 2,  300.00, '2024-01-20', 'completed');
+        INSERT INTO orders VALUES (103, 2, 10, 10, 250.00, '2024-03-05', 'pending');
+        INSERT INTO orders VALUES (104, 3, 20, 1,   75.00, '2024-02-28', 'cancelled');
+        INSERT INTO orders VALUES (105, 1, 40, 5,   50.00, '2024-03-01', 'completed');
+        ",
+    )
+    .unwrap();
+}
+
+// ── INNER JOIN ────────────────────────────────────────────────────────────────
+
+#[test]
+fn inner_join_customers_orders() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, order_id, total_amount
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             ORDER BY order_id",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 100);
+}
+
+#[test]
+fn inner_join_three_tables() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, product_name, quantity, total_amount
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             INNER JOIN products p ON prod_id = product_id
+             WHERE status = 'completed'
+             ORDER BY order_id",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 4);
+    // First row: Alice bought Widget
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "Widget");
+    assert_eq!(rows[0].get::<i64>(2).unwrap(), 4);
+}
+
+// ── LEFT JOIN ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn left_join_customers_without_orders() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    // Diana (customer_id=4) has no orders — should still appear with NULLs
+    let rows = c
+        .query(
+            "SELECT customer_name, order_id
+             FROM customers c
+             LEFT JOIN orders o ON customer_id = cust_id
+             ORDER BY c.customer_id, order_id",
+            &[],
+        )
+        .unwrap();
+
+    // 6 orders + 1 NULL row for Diana = 7
+    assert_eq!(rows.len(), 7);
+    let last = &rows[6];
+    assert_eq!(last.get::<String>(0).unwrap(), "Diana");
+    let order_id: Option<i64> = last.get(1).unwrap();
+    assert!(order_id.is_none(), "Diana should have no orders");
+}
+
+#[test]
+fn left_join_with_nvl_on_null_columns() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, NVL(total_amount, 0) AS amount
+             FROM customers c
+             LEFT JOIN orders o ON customer_id = cust_id
+             WHERE customer_name = 'Diana'",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    let amount: f64 = rows[0].get(1).unwrap();
+    assert_eq!(amount, 0.0);
+}
+
+// ── CROSS JOIN ────────────────────────────────────────────────────────────────
+
+#[test]
+fn cross_join_produces_cartesian_product() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, product_name
+             FROM customers c
+             CROSS JOIN products p
+             ORDER BY customer_id, product_id",
+            &[],
+        )
+        .unwrap();
+
+    // 4 customers x 4 products = 16
+    assert_eq!(rows.len(), 16);
+}
+
+// ── Self-join ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn self_join_customers_same_region() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    // Self-join to find customer pairs in the same region.
+    // Use a subquery approach since snowlite's identifier stripping removes
+    // table alias prefixes, making self-join alias references ambiguous.
+    let rows = c
+        .query(
+            "SELECT cname1, cname2
+             FROM (SELECT customer_id AS cid1, customer_name AS cname1, region AS reg1 FROM customers) a
+             INNER JOIN (SELECT customer_id AS cid2, customer_name AS cname2, region AS reg2 FROM customers) b
+               ON reg1 = reg2
+               AND cid1 < cid2
+             ORDER BY cname1",
+            &[],
+        )
+        .unwrap();
+
+    // US-East has Alice(1) and Diana(4) → one pair
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "Diana");
+}
+
+// ── JOIN with aggregation ─────────────────────────────────────────────────────
+
+#[test]
+fn join_with_group_by_and_aggregate() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, COUNT(order_id) AS order_count, SUM(total_amount) AS total_spent
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name
+             ORDER BY total_spent DESC",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3); // Alice, Bob, Charlie
+    // Bob has the highest total: 300 + 250 = 550
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Bob");
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 2);
+    let total: f64 = rows[0].get(2).unwrap();
+    assert_eq!(total, 550.0);
+}
+
+#[test]
+fn join_with_having_clause() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, SUM(total_amount) AS total_spent
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name
+             HAVING SUM(total_amount) > 100
+             ORDER BY total_spent DESC",
+            &[],
+        )
+        .unwrap();
+
+    // Bob: 550, Alice: 225 — both > 100; Charlie: 75 excluded
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Bob");
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "Alice");
+}
+
+// ── JOIN with Snowflake functions ─────────────────────────────────────────────
+
+#[test]
+fn join_with_iff_and_nvl() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    IFF(total_amount > 100, 'high-value', 'standard') AS tier,
+                    NVL(status, 'unknown') AS order_status
+             FROM customers c
+             LEFT JOIN orders o ON customer_id = cust_id
+             ORDER BY c.customer_id, order_id",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 7);
+    // Diana's row should have NVL applied
+    let diana_row = &rows[6];
+    assert_eq!(diana_row.get::<String>(0).unwrap(), "Diana");
+    assert_eq!(diana_row.get::<String>(2).unwrap(), "unknown");
+}
+
+#[test]
+fn join_with_decode_on_status() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    DECODE(status, 'completed', 'Done', 'pending', 'In Progress', 'cancelled', 'Cancelled', 'Other') AS status_label
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             ORDER BY order_id",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "Done");       // completed
+    assert_eq!(rows[3].get::<String>(1).unwrap(), "In Progress"); // pending
+    assert_eq!(rows[4].get::<String>(1).unwrap(), "Cancelled");   // cancelled
+}
+
+#[test]
+fn join_with_dateadd_and_datediff() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    DATEADD(day, 30, order_date) AS follow_up_date,
+                    DATEDIFF(day, signup_date, order_date) AS days_since_signup
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             WHERE order_id = 100",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "2024-02-14"); // 2024-01-15 + 30 days
+}
+
+// ── JOIN with subqueries ──────────────────────────────────────────────────────
+
+#[test]
+fn join_with_subquery_as_derived_table() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, order_count
+             FROM customers c
+             INNER JOIN (
+                 SELECT cust_id AS cid, COUNT(*) AS order_count
+                 FROM orders
+                 GROUP BY cust_id
+             ) sub ON customer_id = sub.cid
+             ORDER BY order_count DESC",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice"); // 3 orders
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 3);
+}
+
+#[test]
+fn join_with_correlated_subquery_in_where() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    // Find customers who placed orders above the average total_amount
+    let rows = c
+        .query(
+            "SELECT DISTINCT customer_name
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             WHERE total_amount > (SELECT AVG(total_amount) FROM orders)
+             ORDER BY customer_name",
+            &[],
+        )
+        .unwrap();
+
+    // Average: (100+75+300+250+75+50)/6 = 141.67 → orders > 141.67: 300, 250
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Bob");
+}
+
+// ── JOIN with CASE / IFF and GROUP BY ─────────────────────────────────────────
+
+#[test]
+fn join_with_conditional_aggregation() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    SUM(IFF(status = 'completed', total_amount, 0)) AS completed_total,
+                    SUM(IFF(status = 'pending', total_amount, 0)) AS pending_total
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name
+             ORDER BY customer_name",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    // Alice: completed=225 (100+75+50), pending=0
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    let completed: f64 = rows[0].get(1).unwrap();
+    assert_eq!(completed, 225.0);
+    let pending: f64 = rows[0].get(2).unwrap();
+    assert_eq!(pending, 0.0);
+
+    // Bob: completed=300, pending=250
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "Bob");
+    let completed: f64 = rows[1].get(1).unwrap();
+    assert_eq!(completed, 300.0);
+    let pending: f64 = rows[1].get(2).unwrap();
+    assert_eq!(pending, 250.0);
+}
+
+// ── JOIN with COALESCE / NVL2 ─────────────────────────────────────────────────
+
+#[test]
+fn join_with_nvl2_on_nullable_join() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    NVL2(order_id, 'has orders', 'no orders') AS order_status
+             FROM customers c
+             LEFT JOIN orders o ON customer_id = cust_id
+             WHERE customer_name IN ('Alice', 'Diana')
+             GROUP BY customer_name, NVL2(order_id, 'has orders', 'no orders')
+             ORDER BY customer_name",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "has orders");
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "Diana");
+    assert_eq!(rows[1].get::<String>(1).unwrap(), "no orders");
+}
+
+// ── JOIN with category aggregation ────────────────────────────────────────────
+
+#[test]
+fn join_group_by_product_category() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT category,
+                    COUNT(DISTINCT cust_id) AS unique_buyers,
+                    SUM(quantity) AS total_units,
+                    SUM(total_amount) AS revenue
+             FROM orders o
+             INNER JOIN products p ON prod_id = product_id
+             GROUP BY category
+             ORDER BY revenue DESC",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    // Hardware: Widget + Gadget orders
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Hardware");
+}
+
+// ── JOIN with UNION ───────────────────────────────────────────────────────────
+
+#[test]
+fn join_results_combined_with_union_all() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, 'high' AS segment
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name
+             HAVING SUM(total_amount) > 200
+             UNION ALL
+             SELECT customer_name, 'low' AS segment
+             FROM customers c
+             INNER JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name
+             HAVING SUM(total_amount) <= 200
+             ORDER BY customer_name",
+            &[],
+        )
+        .unwrap();
+
+    // Alice(225→high), Bob(550→high), Charlie(75→low)
+    assert_eq!(rows.len(), 3);
+}
+
+// ── JOIN with fully-qualified Snowflake identifiers ──────────────────────────
+
+#[test]
+fn join_with_fully_qualified_identifiers() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    // Three-part identifiers should be stripped to just the table name
+    let rows = c
+        .query(
+            "SELECT customer_name, total_amount
+             FROM mydb.public.customers c
+             INNER JOIN mydb.public.orders o ON customer_id = cust_id
+             WHERE order_id = 100",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Alice");
+    let amount: f64 = rows[0].get(1).unwrap();
+    assert_eq!(amount, 100.0);
+}
+
+#[test]
+fn join_with_two_part_identifiers() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name, product_name
+             FROM public.customers c
+             INNER JOIN public.products p
+               ON product_id IN (SELECT prod_id FROM public.orders WHERE cust_id = customer_id)
+             ORDER BY customer_name, product_name",
+            &[],
+        )
+        .unwrap();
+
+    // Alice ordered Widget, Gadget, Doohickey (3 distinct products)
+    assert!(rows.len() >= 3);
+}
+
+// ── JOIN with multiple Snowflake features combined ──────────────────────────
+
+#[test]
+fn complex_join_with_multiple_snowflake_features() {
+    let c = conn();
+    setup_join_tables(&c);
+
+    let rows = c
+        .query(
+            "SELECT customer_name,
+                    region,
+                    COUNT(order_id) AS num_orders,
+                    SUM(total_amount) AS total_spent,
+                    IFF(SUM(total_amount) > 200, 'VIP', 'Regular') AS customer_tier,
+                    NVL(MAX(order_date), 'N/A') AS last_order
+             FROM customers c
+             LEFT JOIN orders o ON customer_id = cust_id
+             GROUP BY customer_name, region
+             HAVING COUNT(order_id) >= 0
+             ORDER BY total_spent DESC",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 4);
+    // Bob is top spender
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "Bob");
+    assert_eq!(rows[0].get::<String>(4).unwrap(), "VIP");
+    // Diana spent nothing
+    assert_eq!(rows[3].get::<String>(0).unwrap(), "Diana");
+    assert_eq!(rows[3].get::<String>(4).unwrap(), "Regular");
+}
