@@ -39,6 +39,7 @@ pub fn rewrite_functions(sql: &str) -> String {
     let sql = rewrite_date_from_parts(&sql);
     let sql = rewrite_time_from_parts(&sql);
     let sql = rewrite_timestamp_from_parts(&sql);
+    let sql = rewrite_try_cast(&sql);
     let sql = rewrite_cast_operator(&sql);
     let sql = rewrite_listagg(&sql);
     let sql = rewrite_semi_structured_paths(&sql);
@@ -121,6 +122,7 @@ static SIMPLE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // Math
         Rule::new(r"(?i)\bDIV0\s*\(([^,]+),\s*([^)]+)\)", "CASE WHEN $2 = 0 THEN 0 ELSE $1 / $2 END"),
         Rule::new(r"(?i)\bDIV0NULL\s*\(([^,]+),\s*([^)]+)\)", "CASE WHEN $2 = 0 THEN NULL ELSE $1 / $2 END"),
+        Rule::new(r"(?i)\bMOD\s*\(([^,]+),\s*([^)]+)\)", "(($1) % ($2))"),
         Rule::new(r"(?i)\bSQUARE\s*\(([^)]+)\)", "(($1) * ($1))"),
         Rule::new(r"(?i)\bCBRT\s*\(([^)]+)\)", "POWER($1, 1.0/3.0)"),
         Rule::new(r"(?i)\bLN\s*\(([^)]+)\)", "LOG($1)"),
@@ -357,7 +359,7 @@ pub fn rewrite_dateadd(sql: &str) -> String {
 
             // Use paren-aware splitting for the three arguments
             if let Some((unit_str, n, date, consumed)) = split_three_args(&sql[i..]) {
-                let unit = unit_str.trim().to_ascii_lowercase();
+                let unit = unit_str.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
                 let n = n.trim();
                 let date = date.trim();
                 let replacement = match unit.as_str() {
@@ -403,7 +405,7 @@ pub fn rewrite_datediff(sql: &str) -> String {
             i += m.end();
 
             if let Some((unit_str, d1, d2, consumed)) = split_three_args(&sql[i..]) {
-                let unit = unit_str.trim().to_ascii_lowercase();
+                let unit = unit_str.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
                 let d1 = d1.trim();
                 let d2 = d2.trim();
                 let replacement = match unit.as_str() {
@@ -797,6 +799,102 @@ pub fn rewrite_timestamp_from_parts(sql: &str) -> String {
     result
 }
 
+// ── TRY_CAST ─────────────────────────────────────────────────────────────
+
+/// Translate `TRY_CAST(expr AS type)` to a safe CASE expression that returns
+/// NULL when the conversion would fail, matching Snowflake's TRY_CAST behaviour.
+///
+/// For numeric target types (INTEGER, REAL, etc.), produces:
+///   `CASE WHEN snowlite_try_cast_num(expr) IS NOT NULL THEN CAST(expr AS type) ELSE NULL END`
+///
+/// For TEXT/VARCHAR, simply uses `CAST(expr AS TEXT)` (always succeeds).
+///
+/// For other types, falls back to plain `CAST(expr AS type)`.
+pub fn rewrite_try_cast(sql: &str) -> String {
+    static RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)\bTRY_CAST\s*\(").expect("valid TRY_CAST regex")
+    });
+
+    let mut result = String::with_capacity(sql.len());
+    let mut i = 0;
+
+    while i < sql.len() {
+        if let Some(m) = RE.find(&sql[i..]) {
+            result.push_str(&sql[i..i + m.start()]);
+            i += m.end();
+
+            // Extract the content inside the parentheses
+            if let Some(args_content) = extract_parenthesized(&sql[i..]) {
+                // Parse "expr AS type"
+                if let Some((expr, type_name)) = parse_cast_args(args_content) {
+                    let type_upper = type_name.trim().to_uppercase();
+                    let is_numeric = type_upper.starts_with("INT")
+                        || type_upper.starts_with("NUMBER")
+                        || type_upper.starts_with("DECIMAL")
+                        || type_upper.starts_with("NUMERIC")
+                        || type_upper.starts_with("FLOAT")
+                        || type_upper.starts_with("DOUBLE")
+                        || type_upper.starts_with("REAL")
+                        || type_upper == "BIGINT"
+                        || type_upper == "SMALLINT"
+                        || type_upper == "TINYINT";
+
+                    if is_numeric {
+                        result.push_str(&format!(
+                            "CASE WHEN snowlite_try_cast_num({expr}) IS NOT NULL THEN CAST({expr} AS {type_name}) ELSE NULL END"
+                        ));
+                    } else {
+                        // For TEXT and other types, CAST always succeeds
+                        result.push_str(&format!("CAST({expr} AS {type_name})"));
+                    }
+                    i += args_content.len() + 1; // +1 for closing ')'
+                } else {
+                    result.push_str("CAST(");
+                }
+            } else {
+                result.push_str("CAST(");
+            }
+        } else {
+            result.push_str(&sql[i..]);
+            break;
+        }
+    }
+    result
+}
+
+/// Parse `expr AS type` from inside TRY_CAST parentheses.
+fn parse_cast_args(s: &str) -> Option<(&str, &str)> {
+    // Find " AS " keyword (case-insensitive), not inside quotes/parens
+    let bytes = s.as_bytes();
+    let mut depth = 0u32;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for i in 0..bytes.len().saturating_sub(3) {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'(' if !in_single && !in_double => depth += 1,
+            b')' if !in_single && !in_double => depth = depth.saturating_sub(1),
+            b' ' | b'\t' | b'\n' if depth == 0 && !in_single && !in_double => {
+                // Check if next non-whitespace is "AS "
+                let rest = s[i..].trim_start();
+                let rest_lower = rest.to_ascii_lowercase();
+                if rest_lower.starts_with("as ") || rest_lower.starts_with("as\t") {
+                    let expr = s[..i].trim();
+                    let as_pos = s.len() - rest.len();
+                    let type_name = s[as_pos + 3..].trim();
+                    if !type_name.is_empty() {
+                        return Some((expr, type_name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // ── :: cast operator ─────────────────────────────────────────────────────────
 
 /// Translate Snowflake's `expr::TYPE` cast shorthand to `CAST(expr AS TYPE)`.
@@ -1037,5 +1135,41 @@ mod tests {
             "LISTAGG(UPPER(name), '|') WITHIN GROUP (ORDER BY name)",
         );
         assert_eq!(result, "GROUP_CONCAT(UPPER(name), '|')");
+    }
+
+    #[test]
+    fn mod_basic() {
+        assert_eq!(
+            apply_simple_rules("SELECT MOD(10, 3) FROM t"),
+            "SELECT ((10) % (3)) FROM t"
+        );
+    }
+
+    #[test]
+    fn dateadd_with_quoted_unit() {
+        let result = rewrite_dateadd("DATEADD('day', 7, '2024-01-01T00:00:00')");
+        assert!(result.contains("DATE("), "got: {result}");
+        assert!(result.contains("7"), "got: {result}");
+        assert!(!result.contains("DATEADD"), "should not contain DATEADD, got: {result}");
+    }
+
+    #[test]
+    fn datediff_with_quoted_unit() {
+        let result = rewrite_datediff("DATEDIFF('day', '2024-01-01', '2024-01-31')");
+        assert!(result.contains("JULIANDAY"), "got: {result}");
+        assert!(!result.contains("DATEDIFF"), "should not contain DATEDIFF, got: {result}");
+    }
+
+    #[test]
+    fn try_cast_numeric() {
+        let result = rewrite_try_cast("SELECT TRY_CAST('42' AS INTEGER) FROM t");
+        assert!(result.contains("snowlite_try_cast_num"), "got: {result}");
+        assert!(result.contains("CAST('42' AS INTEGER)"), "got: {result}");
+    }
+
+    #[test]
+    fn try_cast_text_passthrough() {
+        let result = rewrite_try_cast("SELECT try_cast(x AS TEXT)");
+        assert_eq!(result, "SELECT CAST(x AS TEXT)");
     }
 }

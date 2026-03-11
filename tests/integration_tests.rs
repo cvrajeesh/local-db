@@ -653,7 +653,6 @@ fn div0null_function() {
 }
 
 #[test]
-#[ignore = "SQRT not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
 fn sqrt_function() {
     let c = conn();
     let rows = c.query("SELECT SQRT(9.0)", &[]).unwrap();
@@ -662,7 +661,6 @@ fn sqrt_function() {
 }
 
 #[test]
-#[ignore = "SQRT not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
 fn sqrt_function_native() {
     let c = conn();
     let rows = c.query("SELECT SQRT(9.0)", &[]).unwrap();
@@ -671,7 +669,6 @@ fn sqrt_function_native() {
 }
 
 #[test]
-#[ignore = "POWER not available: bundled SQLite requires SQLITE_ENABLE_MATH_FUNCTIONS (see failure plan item 13)"]
 fn power_function() {
     let c = conn();
     let rows = c.query("SELECT POWER(2, 10)", &[]).unwrap();
@@ -2489,7 +2486,6 @@ fn convert_timezone_function() {
 }
 
 #[test]
-#[ignore = "TRY_CAST not yet translated (see failure plan item 7)"]
 fn try_cast_returns_null_on_failure() {
     let c = conn();
     let rows = c

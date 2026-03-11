@@ -524,7 +524,42 @@ fn register_custom_functions(conn: &rusqlite::Connection) -> Result<()> {
     use rusqlite::functions::FunctionFlags;
     let det = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
 
-    // LOG(x) — natural logarithm; bundled SQLite does not enable SQLITE_ENABLE_MATH_FUNCTIONS.
+    // Math functions — bundled SQLite does not enable SQLITE_ENABLE_MATH_FUNCTIONS,
+    // so we register CEIL, FLOOR, POWER, SQRT, and LOG as custom scalar functions.
+
+    conn.create_scalar_function("ceil", 1, det, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        Ok(x.ceil())
+    })?;
+    conn.create_scalar_function("ceiling", 1, det, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        Ok(x.ceil())
+    })?;
+    conn.create_scalar_function("floor", 1, det, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        Ok(x.floor())
+    })?;
+    conn.create_scalar_function("power", 2, det, |ctx| {
+        let base: f64 = ctx.get(0)?;
+        let exp: f64 = ctx.get(1)?;
+        Ok(base.powf(exp))
+    })?;
+    conn.create_scalar_function("pow", 2, det, |ctx| {
+        let base: f64 = ctx.get(0)?;
+        let exp: f64 = ctx.get(1)?;
+        Ok(base.powf(exp))
+    })?;
+    conn.create_scalar_function("sqrt", 1, det, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        if x < 0.0 {
+            return Err(rusqlite::Error::UserFunctionError(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "SQRT argument must be non-negative"),
+            )));
+        }
+        Ok(x.sqrt())
+    })?;
+
+    // LOG(x) — natural logarithm.
     // Registered as "log" so that:
     //   LN(x) → LOG(x)                         uses this function (ln)
     //   LOG(base, x) → (LOG(x) / LOG(base))    change-of-base via ln is correct
@@ -765,6 +800,25 @@ fn register_custom_functions(conn: &rusqlite::Connection) -> Result<()> {
     })?;
     conn.create_scalar_function("as_varchar", 1, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
         ctx.get::<String>(0)
+    })?;
+
+    // SNOWLITE_TRY_CAST_NUM(expr) — returns the numeric value if expr can be
+    // converted to a number, or NULL otherwise.  Used by TRY_CAST translation.
+    conn.create_scalar_function("snowlite_try_cast_num", 1, det, |ctx| {
+        let val = ctx.get_raw(0);
+        match val {
+            ValueRef::Integer(i) => Ok(Some(i as f64)),
+            ValueRef::Real(r) => Ok(Some(r)),
+            ValueRef::Text(bytes) => {
+                let s = std::str::from_utf8(bytes).unwrap_or("");
+                match s.trim().parse::<f64>() {
+                    Ok(n) => Ok(Some(n)),
+                    Err(_) => Ok(None),
+                }
+            }
+            ValueRef::Null => Ok(None),
+            ValueRef::Blob(_) => Ok(None),
+        }
     })?;
 
     // TRY_PARSE_JSON — same as passthrough for local testing

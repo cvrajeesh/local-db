@@ -377,6 +377,48 @@ fn snowflake_type_for_value(v: &snowlite::Value) -> &'static str {
     }
 }
 
+/// Infer the Snowflake type for a result column by scanning all rows.
+///
+/// If any non-NULL value in the column is `Real`, the column is reported as
+/// `"REAL"` — even if some rows contain `Integer` values (e.g. a `0` default
+/// from LAG/LEAD).  This prevents the Python connector from misinterpreting
+/// decimal values as integers.
+fn infer_column_type(rows: &[Vec<snowlite::Value>], col_idx: usize) -> &'static str {
+    let mut has_real = false;
+    let mut has_int = false;
+    let mut has_text = false;
+    let mut has_bool = false;
+    let mut has_blob = false;
+
+    for row in rows {
+        if let Some(val) = row.get(col_idx) {
+            match val {
+                snowlite::Value::Real(_) => has_real = true,
+                snowlite::Value::Integer(_) => has_int = true,
+                snowlite::Value::Text(_) => has_text = true,
+                snowlite::Value::Boolean(_) => has_bool = true,
+                snowlite::Value::Blob(_) => has_blob = true,
+                snowlite::Value::Null => {}
+            }
+        }
+    }
+
+    // If any row has a Real value, report as REAL to avoid integer parsing errors
+    if has_real {
+        "REAL"
+    } else if has_int {
+        "FIXED"
+    } else if has_bool {
+        "BOOLEAN"
+    } else if has_blob {
+        "BINARY"
+    } else if has_text {
+        "TEXT"
+    } else {
+        "TEXT"
+    }
+}
+
 // ── Route handlers ───────────────────────────────────────────────────────────
 
 async fn health() -> Json<JsonValue> {
@@ -551,12 +593,12 @@ async fn query_request(
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
-                    // Determine type from first row if available
-                    let sf_type = rows
-                        .first()
-                        .and_then(|row| row.get(i))
-                        .map(snowflake_type_for_value)
-                        .unwrap_or("TEXT");
+                    // Determine type by scanning all rows: if any value is Real,
+                    // report as REAL (not FIXED) so the connector parses decimals
+                    // correctly.  This handles window functions like LAG/LEAD that
+                    // may produce an integer default in one row and reals elsewhere.
+                    let sf_type = infer_column_type(&rows, i);
+                    let scale = if sf_type == "REAL" { 9 } else { 0 };
                     json!({
                         "name": col.name.to_uppercase(),
                         "database": "LOCAL_DB",
@@ -566,7 +608,7 @@ async fn query_request(
                         "type": sf_type,
                         "byteLength": null,
                         "length": null,
-                        "scale": 0,
+                        "scale": scale,
                         "precision": null
                     })
                 })
